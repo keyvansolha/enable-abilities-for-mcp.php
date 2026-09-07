@@ -839,8 +839,33 @@ function ewpa_oauth_maybe_handle_authorize(): void {
 	$client = ewpa_oauth_get_client( $client_id );
 
 	if ( null === $client ) {
-		// Not one of ours — leave it to the library's CIMD resolver.
-		return;
+		// A URL-shaped client_id belongs to a CIMD publisher (Claude, or any
+		// other the trusted-publisher filter admits) — leave it to the
+		// library's resolver at priority 10.
+		if ( ! ewpa_oauth_connectors_enabled() || 0 === strpos( strtolower( $client_id ), 'https://' ) ) {
+			return;
+		}
+
+		// Anything else is an opaque id that only this module could have issued,
+		// so a miss is worth naming. The library's generic "Unknown OAuth
+		// client." gives no hint that the id simply is not registered here.
+		ewpa_oauth_log(
+			'AUTHORIZE',
+			'rejected: client_id is not registered on this site',
+			array( 'client_id' => $client_id )
+		);
+
+		wp_die(
+			esc_html(
+				sprintf(
+					/* translators: %s: the client ID the connector presented */
+					__( 'This connector is not registered on this site. It presented the client ID "%s", which does not exist here — usually because it was typed by hand, or was issued before the connector was removed. Either remove and re-add the connector so it registers itself, or create a client under Settings › WP Abilities › Connection and paste that exact Client ID.', 'enable-abilities-for-mcp' ),
+					$client_id
+				)
+			),
+			esc_html__( 'Unknown OAuth client', 'enable-abilities-for-mcp' ),
+			array( 'response' => 400 )
+		);
 	}
 
 	$redirect_uri          = esc_url_raw( wp_unslash( $_GET['redirect_uri'] ?? '' ) );
