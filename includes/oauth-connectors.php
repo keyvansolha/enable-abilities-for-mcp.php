@@ -839,28 +839,54 @@ function ewpa_oauth_maybe_handle_authorize(): void {
 	$client = ewpa_oauth_get_client( $client_id );
 
 	if ( null === $client ) {
-		// A URL-shaped client_id belongs to a CIMD publisher (Claude, or any
-		// other the trusted-publisher filter admits) — leave it to the
-		// library's resolver at priority 10.
-		if ( ! ewpa_oauth_connectors_enabled() || 0 === strpos( strtolower( $client_id ), 'https://' ) ) {
+		// A missing client_id has its own, clearer message in the library.
+		if ( '' === $client_id ) {
 			return;
 		}
 
-		// Anything else is an opaque id that only this module could have issued,
-		// so a miss is worth naming. The library's generic "Unknown OAuth
-		// client." gives no hint that the id simply is not registered here.
+		// Hand back only what the library can actually resolve: a client_id
+		// whose host is a trusted CIMD publisher (claude.ai, plus anything the
+		// wpmedia_mcp_oauth_trusted_publishers filter adds). Testing the host
+		// rather than the "https://" prefix matters — the library answers an
+		// opaque id and an untrusted URL with the same bare "Unknown OAuth
+		// client.", so a prefix test would let untrusted URLs fall into that
+		// dead end too.
+		if ( ! ewpa_oauth_connectors_enabled() ) {
+			return;
+		}
+
+		if ( class_exists( '\WPMedia\MCP\OAuth\Auth\ClaudeClientVerifier' ) ) {
+			$verifier = new \WPMedia\MCP\OAuth\Auth\ClaudeClientVerifier();
+
+			if ( $verifier->is_trusted_host( $client_id ) ) {
+				return;
+			}
+		} elseif ( 0 === strpos( strtolower( $client_id ), 'https://' ) ) {
+			// Verifier unavailable: fall back to leaving URL-shaped ids alone.
+			return;
+		}
+
+		// Everything else dead-ends in the library with no clue as to why, so
+		// name the id and say which of the two shapes it is.
 		ewpa_oauth_log(
 			'AUTHORIZE',
 			'rejected: client_id is not registered on this site',
 			array( 'client_id' => $client_id )
 		);
 
+		$is_url = 0 === strpos( strtolower( $client_id ), 'https://' );
+
+		$detail = $is_url
+			? __( 'That is a metadata URL, so the connector expects this site to trust its publisher. Only claude.ai is trusted by default — send this whole message over and the publisher can be added.', 'enable-abilities-for-mcp' )
+			: __( 'That is an opaque ID, so it should have been issued by this site. Remove and re-add the connector so it registers itself, or create a client under Settings › WP Abilities › Connection and paste that exact Client ID.', 'enable-abilities-for-mcp' );
+
 		wp_die(
 			esc_html(
 				sprintf(
-					/* translators: %s: the client ID the connector presented */
-					__( 'This connector is not registered on this site. It presented the client ID "%s", which does not exist here — usually because it was typed by hand, or was issued before the connector was removed. Either remove and re-add the connector so it registers itself, or create a client under Settings › WP Abilities › Connection and paste that exact Client ID.', 'enable-abilities-for-mcp' ),
-					$client_id
+					/* translators: 1: the client ID the connector presented, 2: what to do about it */
+					__( 'This connector is not registered on this site. It presented the client ID: %1$s — %2$s', 'enable-abilities-for-mcp' ),
+					$client_id,
+					$detail
 				)
 			),
 			esc_html__( 'Unknown OAuth client', 'enable-abilities-for-mcp' ),
