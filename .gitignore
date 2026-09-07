@@ -1,0 +1,16 @@
+# vendor/ is intentionally TRACKED. There is no composer.json at the plugin
+# root: the dependencies ship with the plugin and it will not run without them.
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Build and dev artifacts, should any be added later
+node_modules/
+composer.lock
+.phpunit.result.cache
+*.log

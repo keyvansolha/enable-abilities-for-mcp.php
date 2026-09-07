@@ -1,0 +1,12 @@
+# Normalise text to LF in the repository regardless of a contributor's
+# core.autocrlf setting. Upstream ships exactly one CRLF file
+# (includes/abilities.php); storing it as LF alongside the other 318 keeps
+# future upstream drops diffing on real changes instead of line endings.
+* text=auto
+
+# Binary — never touch these
+*.mo   binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary

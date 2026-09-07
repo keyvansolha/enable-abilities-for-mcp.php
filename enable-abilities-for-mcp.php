@@ -1,0 +1,1939 @@
+<?php
+/**
+ * Plugin Name:       Enable Abilities for MCP
+ * Plugin URI:        https://mcp.fabiomontenegro.com/
+ * Description:       Connect Claude, ChatGPT & any MCP client to WordPress. 101 abilities: content, SEO, WooCommerce, FSE, LMS & more. Free & self-hosted.
+ * Version:           2.8.0
+ * Requires at least: 6.9
+ * Requires PHP:      8.0
+ * Author:            Fabio Montenegro, keyvansolha
+ * Author URI:        https://fabiomontenegro.com
+ * License:           GPL v2 or later
+ * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain:       enable-abilities-for-mcp
+ *
+ * @package EnableAbilitiesForMCP
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+define( 'EWPA_VERSION', '2.8.0' );
+define( 'EWPA_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
+define( 'EWPA_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
+define( 'EWPA_OPTION_KEY', 'ewpa_enabled_abilities' );
+define( 'EWPA_API_KEY_OPTION', 'ewpa_api_key' );
+
+// Declare WooCommerce HPOS (High-Performance Order Storage) compatibility.
+add_action(
+	'before_woocommerce_init',
+	function () {
+		if ( class_exists( '\Automattic\WooCommerce\Utilities\FeaturesUtil' ) ) {
+			\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility(
+				'custom_order_tables',
+				__FILE__,
+				true
+			);
+		}
+	}
+);
+
+// Includes.
+require_once EWPA_PLUGIN_DIR . 'includes/activity-log.php';
+require_once EWPA_PLUGIN_DIR . 'includes/auth.php';
+require_once EWPA_PLUGIN_DIR . 'includes/admin.php';
+require_once EWPA_PLUGIN_DIR . 'includes/abilities.php';
+require_once EWPA_PLUGIN_DIR . 'includes/thirdparty.php';
+require_once EWPA_PLUGIN_DIR . 'includes/oauth-connectors.php';
+
+// Composer autoloader — runtime dependency wp-media/mcp-oauth (OAuth custom connectors).
+if ( file_exists( EWPA_PLUGIN_DIR . 'vendor/autoload.php' ) ) {
+	require_once EWPA_PLUGIN_DIR . 'vendor/autoload.php';
+}
+
+// OAuth 2.1 layer for claude.ai and ChatGPT custom connectors. Opt-in: Settings › WP Abilities › Connection.
+add_action( 'plugins_loaded', 'ewpa_maybe_boot_oauth', 5 );
+
+/**
+ * Boots the embedded OAuth 2.1 layer (wp-media/mcp-oauth) when enabled.
+ *
+ * Registers /oauth/* endpoints, .well-known discovery documents, and the
+ * JWT-authenticated MCP server at /wp-json/mcp/mcp-oauth-server. When the
+ * option is off, nothing is wired and every OAuth surface 404s.
+ *
+ * @return void
+ */
+function ewpa_maybe_boot_oauth(): void {
+	if ( ! get_option( 'ewpa_oauth_enabled' ) ) {
+		return;
+	}
+
+	if ( ! class_exists( '\WPMedia\MCP\OAuth\Bootstrap' ) ) {
+		return;
+	}
+
+	\WPMedia\MCP\OAuth\Bootstrap::instance();
+
+	// ChatGPT and other RFC 7591 clients, which the library's CIMD-only client
+	// model cannot admit. Adds /oauth/register and the callback allowlist.
+	ewpa_oauth_connectors_boot();
+
+	add_filter( 'redirect_canonical', 'ewpa_oauth_wellknown_no_canonical' );
+	add_action( 'init', 'ewpa_oauth_wellknown_path_suffix_compat', 0 );
+}
+
+// Multisite: the domain root belongs to the main site, but OAuth clients
+// resolve RFC 8414/9728 discovery URLs against it. Bridge root requests
+// to the owning subsite. Runs regardless of the main site's own OAuth state.
+add_action( 'init', 'ewpa_oauth_multisite_discovery_bridge', 0 );
+
+/**
+ * Serves root-level discovery documents for subdirectory subsites.
+ *
+ * For a subsite at https://host/colombia, clients fetch
+ * /.well-known/oauth-authorization-server/colombia and
+ * /.well-known/oauth-protected-resource/colombia/wp-json/... at the domain
+ * root — which the subsite can never serve. When this plugin is active on
+ * the main site, resolve the suffix to the subsite and relay its own
+ * discovery document (loopback, cached briefly).
+ *
+ * @return void
+ */
+function ewpa_oauth_multisite_discovery_bridge(): void {
+	if ( ! is_multisite() || ! is_main_site() ) {
+		return;
+	}
+
+	$uri  = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
+	$path = (string) wp_parse_url( $uri, PHP_URL_PATH );
+
+	if ( ! preg_match( '#^/\.well-known/(oauth-(?:protected-resource|authorization-server))/(.+)$#', $path, $m ) ) {
+		return;
+	}
+
+	$doc   = $m[1];
+	$first = explode( '/', trim( $m[2], '/' ) )[0];
+	$host  = isset( $_SERVER['HTTP_HOST'] ) ? sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ) ) : '';
+
+	$blog_id = get_blog_id_from_url( $host, '/' . $first . '/' );
+	if ( ! $blog_id || (int) get_main_site_id() === $blog_id ) {
+		return; // Not a subsite path — main-site suffixes are handled by the compat rewrite.
+	}
+
+	$target    = trailingslashit( get_home_url( $blog_id ) ) . '.well-known/' . $doc;
+	$cache_key = 'ewpa_oauth_bridge_' . md5( $target );
+	$body      = get_transient( $cache_key );
+
+	if ( false === $body ) {
+		$response = wp_remote_get( $target, array( 'timeout' => 10 ) );
+
+		if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
+			return; // Subsite has OAuth disabled (or unreachable) — fall through to a normal 404.
+		}
+
+		$body = wp_remote_retrieve_body( $response );
+		set_transient( $cache_key, $body, 5 * MINUTE_IN_SECONDS );
+	}
+
+	header( 'Content-Type: application/json; charset=UTF-8' );
+	echo $body; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- JSON relayed verbatim from the subsite's own discovery endpoint.
+	exit;
+}
+
+/**
+ * Returns the site's base path (without trailing slash) for OAuth URL matching.
+ *
+ * Empty string for root installs; e.g. "/colombia" for subdirectory or
+ * multisite-subdirectory installs, where every OAuth surface lives under
+ * the subsite path.
+ *
+ * @return string
+ */
+function ewpa_oauth_home_path(): string {
+	$path = (string) wp_parse_url( home_url( '/' ), PHP_URL_PATH );
+
+	return '/' === $path ? '' : rtrim( $path, '/' );
+}
+
+/**
+ * Serves RFC 9728 path-suffixed discovery URLs from the root documents.
+ *
+ * Some OAuth clients (e.g. the claude.ai connector backend) request
+ * /.well-known/oauth-protected-resource/<mcp-server-path> per RFC 9728 §3.1.
+ * The embedded library only registers the root variants, so those requests
+ * 404. Rewriting the URI before WP parses the request lets the library's
+ * rewrite rule match and serve the same document. Subdirectory installs are
+ * matched under their base path (e.g. /colombia/.well-known/...).
+ *
+ * @return void
+ */
+function ewpa_oauth_wellknown_path_suffix_compat(): void {
+	$uri  = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
+	$base = preg_quote( ewpa_oauth_home_path(), '#' );
+
+	if ( preg_match( '#^(' . $base . '/\.well-known/oauth-(?:protected-resource|authorization-server))/.+#', $uri, $m ) ) {
+		$_SERVER['REQUEST_URI'] = $m[1];
+	}
+}
+
+/**
+ * Prevents the canonical trailing-slash redirect on OAuth discovery documents.
+ *
+ * RFC 8414 metadata URLs have no trailing slash; WordPress's canonical
+ * redirect 301s them to the slashed variant, which strict OAuth clients
+ * (e.g. the claude.ai connector backend) reject as a failed metadata fetch.
+ * Matches under the site's base path so subdirectory installs are covered.
+ *
+ * @param string|false $redirect_url Canonical redirect target.
+ * @return string|false
+ */
+function ewpa_oauth_wellknown_no_canonical( $redirect_url ) {
+	$path = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_parse_url( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ), PHP_URL_PATH ) : '';
+	$base = preg_quote( ewpa_oauth_home_path(), '#' );
+
+	if ( preg_match( '#^' . $base . '/(\.well-known/oauth-(protected-resource|authorization-server)|oauth/[a-z-]+)/?$#', $path ) ) {
+		return false;
+	}
+
+	return $redirect_url;
+}
+
+// Activation: set all abilities enabled by default.
+register_activation_hook( __FILE__, 'ewpa_activate' );
+
+// Upgrade: runs once per version to handle file-only updates (no reactivation).
+add_action( 'plugins_loaded', 'ewpa_maybe_upgrade' );
+
+/**
+ * Runs database and option migrations when the plugin version changes.
+ * Handles upgrades where the user replaced files without reactivating.
+ */
+function ewpa_maybe_upgrade(): void {
+	if ( get_option( 'ewpa_db_version' ) === EWPA_VERSION ) {
+		return;
+	}
+
+	ewpa_create_activity_log_table();
+
+	if ( false === get_option( 'ewpa_bearer_enabled' ) && get_option( EWPA_API_KEY_OPTION ) ) {
+		update_option( 'ewpa_bearer_enabled', true );
+	}
+
+	update_option( 'ewpa_db_version', EWPA_VERSION );
+}
+
+/**
+ * Plugin activation callback.
+ *
+ * Sets all abilities as enabled on first install.
+ *
+ * @return void
+ */
+function ewpa_activate() {
+	if ( false === get_option( EWPA_OPTION_KEY ) ) {
+		update_option( EWPA_OPTION_KEY, ewpa_get_all_ability_keys() );
+	}
+
+	// Auto-enable Bearer token for existing installs that already have a key.
+	if ( false === get_option( 'ewpa_bearer_enabled' ) && get_option( EWPA_API_KEY_OPTION ) ) {
+		update_option( 'ewpa_bearer_enabled', true );
+	}
+
+	ewpa_create_activity_log_table();
+}
+
+// Hooks.
+add_filter( 'wp_register_ability_args', 'ewpa_filter_core_abilities', 10, 2 );
+add_action( 'wp_abilities_api_init', 'ewpa_register_custom_abilities' );
+add_action( 'wp_abilities_api_categories_init', 'ewpa_register_ability_categories' );
+
+// Migration: rename Spanish keys to English on upgrade.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys' );
+
+// Migration: add abilities introduced in v2.0.7 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v207' );
+
+// Migration: add ewpa/get-post-translations introduced in v2.0.8 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v208' );
+
+// Migration: add ewpa/update-rankmath-schema introduced in v2.0.8b to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v208b' );
+
+// Migration: add JetEngine Options Pages abilities introduced in v2.0.14 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v2014' );
+
+// Migration: add ewpa/get-seopress-content-analysis introduced in v2.0.20 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v2020' );
+
+// Migration: add LearnDash read abilities introduced in v2.0.21 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v2021' );
+
+// Migration: add ewpa/get-llms-txt introduced in v2.0.22 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v2022' );
+
+// Migration: add ewpa/clear-cache introduced in v2.0.24 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v2024' );
+
+// Adds the v2.3.0 Navigation Menus abilities (read + additive) to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v230' );
+
+// Adds the v2.4.0 Tutor LMS abilities to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v240' );
+
+// Adds the v2.5.0 Tutor LMS course/progress/quiz abilities to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v250' );
+
+// Adds ewpa/duplicate-post introduced in v2.5.0 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v251' );
+
+// Adds the v2.6.0 FSE Block Templates read abilities to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v260' );
+
+// Adds the v2.7.0 term meta abilities to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v270' );
+
+// Adds ewpa/update-term introduced in v2.7.1 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v271' );
+
+// Adds the v2.7.2 JetEngine Query Builder read abilities to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v272' );
+
+// Adds ewpa/get-accessibility-snapshot introduced in v2.8.0 to existing installs.
+add_action( 'plugins_loaded', 'ewpa_maybe_migrate_keys_v280' );
+
+
+/*
+ * ==========================================================================
+ * KEY MIGRATION (v1.7 → v1.9)
+ * ==========================================================================
+ * Renames Spanish ability keys to English while preserving enabled/disabled
+ * state. Runs once on upgrade.
+ * ==========================================================================
+ */
+
+/**
+ * Migrates ability keys from Spanish to English.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys() {
+	if ( get_option( 'ewpa_keys_migrated_v19' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v19', true );
+		return;
+	}
+
+	$key_map = ewpa_get_legacy_key_map();
+
+	// Check if any old key exists.
+	$has_old_keys = false;
+	foreach ( $enabled as $key ) {
+		if ( isset( $key_map[ $key ] ) ) {
+			$has_old_keys = true;
+			break;
+		}
+	}
+
+	if ( ! $has_old_keys ) {
+		update_option( 'ewpa_keys_migrated_v19', true );
+		return;
+	}
+
+	// Map old keys to new keys.
+	$migrated = array();
+	foreach ( $enabled as $key ) {
+		$migrated[] = isset( $key_map[ $key ] ) ? $key_map[ $key ] : $key;
+	}
+
+	// Add new abilities (enabled by default on upgrade).
+	$new_abilities = array(
+		'ewpa/list-post-types',
+		'ewpa/get-cpt-items',
+		'ewpa/get-cpt-item',
+		'ewpa/create-cpt-item',
+		'ewpa/update-cpt-item',
+		'ewpa/delete-cpt-item',
+		'ewpa/get-cpt-taxonomies',
+		'ewpa/assign-cpt-terms',
+		// WooCommerce abilities (v1.9+).
+		'ewpa/wc-get-products',
+		'ewpa/wc-get-product',
+		'ewpa/wc-update-product',
+		'ewpa/wc-get-orders',
+		'ewpa/wc-get-order',
+		'ewpa/wc-update-order-status',
+		'ewpa/wc-get-customers',
+		// The Events Calendar abilities (v1.9+).
+		'ewpa/tec-get-events',
+		'ewpa/tec-get-event',
+		'ewpa/tec-create-event',
+		'ewpa/tec-update-event',
+		// v1.9.2+.
+		'ewpa/get-page',
+		'ewpa/update-comment',
+	);
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $migrated, true ) ) {
+			$migrated[] = $key;
+		}
+	}
+
+	update_option( EWPA_OPTION_KEY, $migrated );
+	update_option( 'ewpa_keys_migrated_v19', true );
+
+	// Schedule a one-time admin notice.
+	set_transient( 'ewpa_migration_notice', true, 60 );
+}
+
+/**
+ * Adds abilities introduced in v2.0.7 to existing installs (enabled by default).
+ * Also back-fills ewpa/get-post-meta which was added in 2.0.6 without a migration.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v207() {
+	if ( get_option( 'ewpa_keys_migrated_v207' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v207', true );
+		return;
+	}
+
+	$new_abilities = array(
+		'ewpa/get-post-meta',
+		'ewpa/get-active-plugins',
+		'ewpa/set-post-language',
+		'ewpa/link-post-translation',
+		'ewpa/get-post-translations',
+	);
+
+	$changed = false;
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $enabled, true ) ) {
+			$enabled[] = $key;
+			$changed   = true;
+		}
+	}
+
+	if ( $changed ) {
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v207', true );
+}
+
+/**
+ * Adds ewpa/get-post-translations to existing installs that already ran the v207 migration.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v208() {
+	if ( get_option( 'ewpa_keys_migrated_v208' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v208', true );
+		return;
+	}
+
+	if ( ! in_array( 'ewpa/get-post-translations', $enabled, true ) ) {
+		$enabled[] = 'ewpa/get-post-translations';
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v208', true );
+}
+
+/**
+ * Adds ewpa/update-rankmath-schema to existing installs (introduced in v2.0.8b).
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v208b() {
+	if ( get_option( 'ewpa_keys_migrated_v208b' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v208b', true );
+		return;
+	}
+
+	if ( ! in_array( 'ewpa/update-rankmath-schema', $enabled, true ) ) {
+		$enabled[] = 'ewpa/update-rankmath-schema';
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v208b', true );
+}
+
+/**
+ * Adds JetEngine Options Pages abilities introduced in v2.0.14 to existing installs.
+ *
+ * Auto-enables ewpa/je-list-options-pages and ewpa/je-get-options-page.
+ * ewpa/je-update-options-page-field is NOT added (default=false, opt-in only).
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v2014(): void {
+	if ( get_option( 'ewpa_keys_migrated_v2014' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v2014', true );
+		return;
+	}
+
+	$new_abilities = array(
+		'ewpa/je-list-options-pages',
+		'ewpa/je-get-options-page',
+	);
+
+	$changed = false;
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $enabled, true ) ) {
+			$enabled[] = $key;
+			$changed   = true;
+		}
+	}
+
+	if ( $changed ) {
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v2014', true );
+}
+
+/**
+ * Adds the SEOPress content analysis ability introduced in v2.0.20 to existing installs.
+ *
+ * Auto-enables ewpa/get-seopress-content-analysis (read-only ability).
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v2020(): void {
+	if ( get_option( 'ewpa_keys_migrated_v2020' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v2020', true );
+		return;
+	}
+
+	if ( ! in_array( 'ewpa/get-seopress-content-analysis', $enabled, true ) ) {
+		$enabled[] = 'ewpa/get-seopress-content-analysis';
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v2020', true );
+}
+
+/**
+ * Adds the LearnDash read abilities introduced in v2.0.21 to existing installs.
+ *
+ * Auto-enables the four read-only abilities. The two write abilities
+ * (ld-enroll-user, ld-unenroll-user) are opt-in and NOT added automatically.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v2021(): void {
+	if ( get_option( 'ewpa_keys_migrated_v2021' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v2021', true );
+		return;
+	}
+
+	$new_abilities = array(
+		'ewpa/ld-get-courses',
+		'ewpa/ld-get-course',
+		'ewpa/ld-get-user-progress',
+		'ewpa/ld-get-quiz-results',
+	);
+
+	$changed = false;
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $enabled, true ) ) {
+			$enabled[] = $key;
+			$changed   = true;
+		}
+	}
+
+	if ( $changed ) {
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v2021', true );
+}
+
+/**
+ * Adds the llms.txt read ability introduced in v2.0.22 to existing installs.
+ *
+ * Auto-enables ewpa/get-llms-txt (read-only). ewpa/update-llms-txt is
+ * NOT added (opt-in, default false).
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v2022(): void {
+	if ( get_option( 'ewpa_keys_migrated_v2022' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v2022', true );
+		return;
+	}
+
+	if ( ! in_array( 'ewpa/get-llms-txt', $enabled, true ) ) {
+		$enabled[] = 'ewpa/get-llms-txt';
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v2022', true );
+}
+
+/**
+ * Adds the cache purge ability introduced in v2.0.24 to existing installs.
+ *
+ * Auto-enables ewpa/clear-cache: it closes the stale-cache loop after
+ * meta-only write abilities, and per-post purge still requires edit_post
+ * (site-wide requires manage_options).
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v2024(): void {
+	if ( get_option( 'ewpa_keys_migrated_v2024' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v2024', true );
+		return;
+	}
+
+	if ( ! in_array( 'ewpa/clear-cache', $enabled, true ) ) {
+		$enabled[] = 'ewpa/clear-cache';
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v2024', true );
+}
+
+/**
+ * Adds the Navigation Menus abilities introduced in v2.3.0 to existing installs.
+ *
+ * Read and additive abilities are enabled by default; ewpa/remove-menu-item
+ * and ewpa/assign-menu-location are opt-in and stay disabled until the site
+ * owner enables them.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v230() {
+	if ( get_option( 'ewpa_keys_migrated_v230' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v230', true );
+		return;
+	}
+
+	$new_abilities = array(
+		'ewpa/create-menu',
+		'ewpa/list-menus',
+		'ewpa/get-menu',
+		'ewpa/add-menu-item',
+		'ewpa/update-menu-item',
+	);
+
+	$changed = false;
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $enabled, true ) ) {
+			$enabled[] = $key;
+			$changed   = true;
+		}
+	}
+
+	if ( $changed ) {
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v230', true );
+}
+
+/**
+ * Adds the Tutor LMS abilities introduced in v2.4.0 to existing installs.
+ *
+ * Both abilities are enabled by default (not opt-in): they read or overwrite
+ * a single known meta field on a specific lesson, the same class of
+ * operation as ewpa/update-post-meta and ewpa/update-post, which are also
+ * enabled by default.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v240() {
+	if ( get_option( 'ewpa_keys_migrated_v240' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v240', true );
+		return;
+	}
+
+	$new_abilities = array(
+		'ewpa/tutor-get-lesson-video',
+		'ewpa/tutor-update-lesson-video',
+	);
+
+	$changed = false;
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $enabled, true ) ) {
+			$enabled[] = $key;
+			$changed   = true;
+		}
+	}
+
+	if ( $changed ) {
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v240', true );
+}
+
+/**
+ * Adds the Tutor LMS course/progress/quiz abilities introduced in v2.5.0 to existing installs.
+ *
+ * Read abilities only. ewpa/tutor-enroll-user and ewpa/tutor-unenroll-user
+ * are opt-in (manage_options, write) and stay disabled, matching the
+ * ewpa/ld-enroll-user / ewpa/ld-unenroll-user precedent.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v250() {
+	if ( get_option( 'ewpa_keys_migrated_v250' ) ) {
+		return;
+	}
+
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		update_option( 'ewpa_keys_migrated_v250', true );
+		return;
+	}
+
+	$new_abilities = array(
+		'ewpa/tutor-get-courses',
+		'ewpa/tutor-get-course',
+		'ewpa/tutor-get-user-progress',
+		'ewpa/tutor-get-quiz-results',
+	);
+
+	$changed = false;
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $enabled, true ) ) {
+			$enabled[] = $key;
+			$changed   = true;
+		}
+	}
+
+	if ( $changed ) {
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+
+	update_option( 'ewpa_keys_migrated_v250', true );
+}
+
+/**
+ * Adds ewpa/duplicate-post introduced in v2.5.0 to existing installs.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v251(): void {
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		return;
+	}
+	if ( ! in_array( 'ewpa/duplicate-post', $enabled, true ) ) {
+		$enabled[] = 'ewpa/duplicate-post';
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+}
+
+/**
+ * Adds the FSE Block Templates read abilities introduced in v2.6.0 to existing installs.
+ *
+ * Read abilities only. ewpa/fse-update-template is opt-in (edit_theme_options, write)
+ * and stays disabled, matching the ewpa/ld-enroll-user / ewpa/tutor-enroll-user precedent.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v260(): void {
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		return;
+	}
+
+	$new_abilities = array(
+		'ewpa/fse-list-templates',
+		'ewpa/fse-get-template',
+	);
+
+	$changed = false;
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $enabled, true ) ) {
+			$enabled[] = $key;
+			$changed   = true;
+		}
+	}
+
+	if ( $changed ) {
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+}
+
+/**
+ * Adds the term meta abilities introduced in v2.7.0 to existing installs.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v270(): void {
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		return;
+	}
+
+	$new_abilities = array(
+		'ewpa/get-term-meta',
+		'ewpa/update-term-meta',
+	);
+
+	$changed = false;
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $enabled, true ) ) {
+			$enabled[] = $key;
+			$changed   = true;
+		}
+	}
+
+	if ( $changed ) {
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+}
+
+/**
+ * Adds ewpa/update-term introduced in v2.7.1 to existing installs.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v271(): void {
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		return;
+	}
+	if ( ! in_array( 'ewpa/update-term', $enabled, true ) ) {
+		$enabled[] = 'ewpa/update-term';
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+}
+
+/**
+ * Adds the JetEngine Query Builder read abilities introduced in v2.7.2 to
+ * existing installs.
+ *
+ * Read abilities only. ewpa/je-update-query is opt-in (destructive, write)
+ * and stays disabled, matching the ewpa/je-update-options-page-field
+ * precedent.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v272(): void {
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		return;
+	}
+
+	$new_abilities = array(
+		'ewpa/je-list-queries',
+		'ewpa/je-get-query',
+	);
+
+	$changed = false;
+	foreach ( $new_abilities as $key ) {
+		if ( ! in_array( $key, $enabled, true ) ) {
+			$enabled[] = $key;
+			$changed   = true;
+		}
+	}
+
+	if ( $changed ) {
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+}
+
+/**
+ * Adds ewpa/get-accessibility-snapshot introduced in v2.8.0 to existing installs.
+ *
+ * @return void
+ */
+function ewpa_maybe_migrate_keys_v280(): void {
+	$enabled = get_option( EWPA_OPTION_KEY );
+	if ( ! is_array( $enabled ) ) {
+		return;
+	}
+	if ( ! in_array( 'ewpa/get-accessibility-snapshot', $enabled, true ) ) {
+		$enabled[] = 'ewpa/get-accessibility-snapshot';
+		update_option( EWPA_OPTION_KEY, $enabled );
+	}
+}
+
+/**
+ * Runs all ability key migrations in order.
+ *
+ * Called at the start of ewpa_register_custom_abilities() so every migration
+ * completes before any ewpa_is_ability_enabled() check runs — regardless of
+ * when wp_abilities_api_init fires relative to plugins_loaded.
+ *
+ * @return void
+ */
+function ewpa_run_migrations(): void {
+	ewpa_maybe_migrate_keys_v251();
+	ewpa_maybe_migrate_keys_v260();
+	ewpa_maybe_migrate_keys_v270();
+	ewpa_maybe_migrate_keys_v271();
+	ewpa_maybe_migrate_keys_v272();
+	ewpa_maybe_migrate_keys_v280();
+}
+
+/**
+ * Returns the mapping from old Spanish keys to new English keys.
+ *
+ * @return array
+ */
+function ewpa_get_legacy_key_map() {
+	return array(
+		'ewpa/obtener-posts'        => 'ewpa/get-posts',
+		'ewpa/obtener-post'         => 'ewpa/get-post',
+		'ewpa/obtener-categorias'   => 'ewpa/get-categories',
+		'ewpa/obtener-tags'         => 'ewpa/get-tags',
+		'ewpa/obtener-paginas'      => 'ewpa/get-pages',
+		'ewpa/obtener-comentarios'  => 'ewpa/get-comments',
+		'ewpa/obtener-medios'       => 'ewpa/get-media',
+		'ewpa/obtener-usuarios'     => 'ewpa/get-users',
+		'ewpa/crear-post'           => 'ewpa/create-post',
+		'ewpa/actualizar-post'      => 'ewpa/update-post',
+		'ewpa/eliminar-post'        => 'ewpa/delete-post',
+		'ewpa/crear-categoria'      => 'ewpa/create-category',
+		'ewpa/crear-tag'            => 'ewpa/create-tag',
+		'ewpa/crear-pagina'         => 'ewpa/create-page',
+		'ewpa/moderar-comentario'   => 'ewpa/moderate-comment',
+		'ewpa/responder-comentario' => 'ewpa/reply-comment',
+		'ewpa/subir-imagen'         => 'ewpa/upload-image',
+		'ewpa/obtener-rankmath'     => 'ewpa/get-rankmath',
+		'ewpa/actualizar-rankmath'  => 'ewpa/update-rankmath',
+		'ewpa/buscar-reemplazar'    => 'ewpa/search-replace',
+		'ewpa/estadisticas-sitio'   => 'ewpa/site-stats',
+	);
+}
+
+
+/*
+ * ==========================================================================
+ * ABILITIES REGISTRY
+ * ==========================================================================
+ * Central data structure defining all available abilities with metadata.
+ * Used by both the admin UI and the registration functions.
+ * ==========================================================================
+ */
+
+/**
+ * Returns the registry of all abilities organized by section.
+ *
+ * @return array
+ */
+function ewpa_get_abilities_registry() {
+	return array(
+		'core'        => array(
+			'section_label' => __( 'WordPress Core', 'enable-abilities-for-mcp' ),
+			'section_desc'  => __( 'Native WordPress core abilities. Exposed to MCP with the public flag.', 'enable-abilities-for-mcp' ),
+			'section_icon'  => 'dashicons-wordpress',
+			'abilities'     => array(
+				'core/get-site-info'        => array(
+					'label' => __( 'Site Information', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'General site data: name, URL, description, language, timezone, WP version.', 'enable-abilities-for-mcp' ),
+				),
+				'core/get-user-info'        => array(
+					'label' => __( 'User Information', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Current user data: name, email, role, avatar.', 'enable-abilities-for-mcp' ),
+				),
+				'core/get-environment-info' => array(
+					'label' => __( 'Environment Information', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Technical details: PHP version, DB server, environment type.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'read'        => array(
+			'section_label' => __( 'Read (Query Only)', 'enable-abilities-for-mcp' ),
+			'section_desc'  => __( 'Only query data, do not modify anything. Safest to expose via MCP.', 'enable-abilities-for-mcp' ),
+			'section_icon'  => 'dashicons-visibility',
+			'abilities'     => array(
+				'ewpa/get-posts'      => array(
+					'label' => __( 'Get Posts', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List posts with filters by status, category, count, and order.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-post'       => array(
+					'label' => __( 'Get Single Post', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Full post detail by ID, including content, meta data, and featured image.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-categories' => array(
+					'label' => __( 'Get Categories', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List all categories with ID, name, slug, and post count.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-tags'       => array(
+					'label' => __( 'Get Tags', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List all tags with ID, name, slug, and post count.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-pages'      => array(
+					'label' => __( 'Get Pages', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List site pages with title, status, and hierarchy.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-page'       => array(
+					'label' => __( 'Get Single Page', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Full page detail by ID, including content, template, hierarchy, and SEO metadata.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-comments'   => array(
+					'label' => __( 'Get Comments', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List comments with filters by status, post, and count.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-media'      => array(
+					'label' => __( 'Get Media', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List media library files with filters by type.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-users'      => array(
+					'label' => __( 'Get Users', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List site users with ID, name, email, and role.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'write'       => array(
+			'section_label' => __( 'Write (Create & Modify)', 'enable-abilities-for-mcp' ),
+			'section_desc'  => __( 'Create or modify content. Require appropriate MCP user permissions.', 'enable-abilities-for-mcp' ),
+			'section_icon'  => 'dashicons-edit',
+			'section_badge' => 'warning',
+			'abilities'     => array(
+				'ewpa/create-post'      => array(
+					'label' => __( 'Create Post', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Create a new post with title, content, categories, tags, featured image, and more.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-post'      => array(
+					'label' => __( 'Update Post', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Modify an existing post. Only updates the fields provided.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/delete-post'      => array(
+					'label' => __( 'Delete Post', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Send a post to trash or permanently delete it.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/create-category'  => array(
+					'label' => __( 'Create Category', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Create a new category with name, slug, description, and parent.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/create-tag'       => array(
+					'label' => __( 'Create Tag', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Create a new tag with name, slug, and description.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/create-page'      => array(
+					'label' => __( 'Create Page', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Create a new page with title, content, status, and parent page.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/moderate-comment' => array(
+					'label' => __( 'Moderate Comment', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Change comment status: approve, hold, spam, or trash.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/reply-comment'    => array(
+					'label' => __( 'Reply to Comment', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Reply to an existing comment as the authenticated user.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-comment'   => array(
+					'label' => __( 'Update Comment', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Update content, author name, email, or WordPress user of an existing comment.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/upload-image'     => array(
+					'label' => __( 'Upload Image from URL', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Download an image from an external URL and register it in the media library. Returns the attachment ID.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/duplicate-post'   => array(
+					'label' => __( 'Duplicate Post / Page / CPT', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Create an exact copy of any post, page, or CPT item — including all meta and taxonomy terms. The duplicate is saved as draft by default.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'seo'         => array(
+			'section_label'  => __( 'SEO — Rank Math', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Query and update Rank Math SEO metadata on posts and pages.', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-search',
+			'section_notice' => 'ewpa_section_notice_rankmath',
+			'abilities'      => array(
+				'ewpa/get-rankmath'    => array(
+					'label' => __( 'Get Rank Math Metadata', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Get Rank Math SEO metadata for a post or page: title, description, keywords, robots, Open Graph, and more.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-rankmath'        => array(
+					'label' => __( 'Update Rank Math SEO / Focus Keyword', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Update focus keyword, SEO title, description, canonical URL, robots, and Open Graph via Rank Math.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-rankmath-schema' => array(
+					'label' => __( 'Update Rank Math Schema', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Write a structured-data schema block (FAQPage, Article, Product, etc.) to a Rank Math schema meta key as a PHP-serialized array, so it renders as JSON-LD in <head>.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'seopress'    => array(
+			'section_label'  => __( 'SEO — SEOPress', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Query and update SEOPress metadata on posts and pages.', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-search',
+			'section_notice' => 'ewpa_section_notice_seopress',
+			'abilities'      => array(
+				'ewpa/get-seopress'    => array(
+					'label' => __( 'Get SEOPress Metadata', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Get SEOPress metadata for a post or page: title, description, focus keyword, robots, canonical, Open Graph, and Twitter Card.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-seopress' => array(
+					'label' => __( 'Update SEOPress Metadata', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Update SEOPress SEO title, description, focus keyword, canonical URL, robots directives, and Open Graph / Twitter Card fields.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-seopress-content-analysis' => array(
+					'label' => __( 'Get SEOPress Content Analysis', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Read the SEOPress content analysis checks and recommendations for a post or page, optionally running a fresh analysis first. Requires SEOPress 7.5+.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'yoast'       => array(
+			'section_label'  => __( 'SEO — Yoast SEO', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Query and update Yoast SEO metadata on posts and pages.', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-search',
+			'section_notice' => 'ewpa_section_notice_yoast',
+			'abilities'      => array(
+				'ewpa/yoast-get-seo'           => array(
+					'label' => __( 'Get Yoast SEO Metadata', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Get Yoast SEO metadata for a post or page: title, description, focus keyphrase, canonical, robots, Open Graph, and Twitter Card.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/yoast-update-seo'        => array(
+					'label' => __( 'Update Yoast SEO Metadata', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Update Yoast SEO title, description, focus keyphrase, canonical URL, robots, and Open Graph / Twitter Card fields.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/yoast-get-sitemap-index' => array(
+					'label' => __( 'Get Yoast Sitemap Index', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Fetch and parse the Yoast SEO sitemap index, returning the list of all sitemap URLs registered on the site.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'menus'       => array(
+			'section_label' => __( 'Navigation Menus', 'enable-abilities-for-mcp' ),
+			'section_desc'  => __( 'Inspect and manage navigation menus, their items, and theme locations.', 'enable-abilities-for-mcp' ),
+			'section_icon'  => 'dashicons-menu-alt',
+			'abilities'     => array(
+				'ewpa/create-menu'          => array(
+					'label' => __( 'Create Menu', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Creates a new, empty navigation menu with the given name.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/list-menus'           => array(
+					'label' => __( 'List Menus', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Lists every menu with its id, slug, and item count, plus the theme locations and which menu each one displays.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-menu'             => array(
+					'label' => __( 'Get Menu', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Returns every item of one menu with hierarchy, destination, and position.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/add-menu-item'        => array(
+					'label' => __( 'Add Menu Item', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Adds a page, post, category, tag, or custom URL to a menu, with optional parent and position.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-menu-item'     => array(
+					'label' => __( 'Update Menu Item', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Updates the title, custom URL, parent, or position of one menu item.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/remove-menu-item'     => array(
+					'label' => __( 'Remove Menu Item', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Permanently removes one item from a menu. Destructive — opt-in required.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/assign-menu-location' => array(
+					'label' => __( 'Assign Menu Location', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Assigns a menu to a theme location. Changes site-wide navigation — opt-in required.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/delete-menu'          => array(
+					'label' => __( 'Delete Menu', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Permanently deletes a menu and all of its items. Destructive — opt-in required.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'utility'     => array(
+			'section_label' => __( 'Utility', 'enable-abilities-for-mcp' ),
+			'section_desc'  => __( 'Auxiliary tools that complement the workflow.', 'enable-abilities-for-mcp' ),
+			'section_icon'  => 'dashicons-admin-tools',
+			'abilities'     => array(
+				'ewpa/search-replace' => array(
+					'label' => __( 'Search and Replace', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Search for text in a post content and replace it with another.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/site-stats'        => array(
+					'label' => __( 'Site Statistics', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Site summary: total posts, pages, categories, tags, comments, and users.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-post-meta'  => array(
+					'label' => __( 'Update Post Meta', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Write any post meta field by exact key. Requires edit_post capability on the target post.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-post-meta'      => array(
+					'label' => __( 'Get Post Meta', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Read any single post meta field by exact key. Returns the value and whether the key exists.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-active-plugins' => array(
+					'label' => __( 'Get Active Plugins', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Returns all active plugins with name, version, and detected capabilities (SEO, multilanguage, WooCommerce, etc.).', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/clear-cache'        => array(
+					'label' => __( 'Clear Cache', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Purge the page cache for one post or the whole site. Auto-detects WP Rocket, LiteSpeed Cache, W3 Total Cache, WP Super Cache, and WP Fastest Cache. Essential after meta-only writes (SEO fixes, Elementor edits) that do not trigger the cache plugin\'s own purge.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'code-snippets' => array(
+				'section_label'  => __( 'Code Snippets', 'enable-abilities-for-mcp' ),
+				'section_desc'   => __( 'Create PHP code snippets via the Code Snippets plugin. Requires manage_options. Snippets are always created as inactive — they must be activated manually from wp-admin › Snippets.', 'enable-abilities-for-mcp' ),
+				'section_icon'   => 'dashicons-editor-code',
+				'section_badge'  => 'danger',
+				'section_notice' => 'ewpa_section_notice_code_snippets',
+				'abilities'      => array(
+					'ewpa/create-code-snippet' => array(
+						'label' => __( 'Create Code Snippet', 'enable-abilities-for-mcp' ),
+						'desc'  => __( 'Creates a PHP snippet (always inactive). Validates syntax, blocks dangerous functions (eval, exec, shell_exec, etc.), and fires an audit action hook.', 'enable-abilities-for-mcp' ),
+					),
+				),
+			),
+			'multilanguage' => array(
+			'section_label'  => __( 'Multilanguage', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Assign languages and link translation groups between posts via Polylang or WPML.', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-translation',
+			'section_badge'  => 'warning',
+			'section_notice' => 'ewpa_section_notice_multilanguage',
+			'abilities'      => array(
+				'ewpa/set-post-language'    => array(
+					'label' => __( 'Set Post Language', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Assign a language code to an existing post via Polylang or WPML.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/link-post-translation'  => array(
+					'label' => __( 'Link Post Translation', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Link two posts as translations of each other in the same translation group.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-post-translations'  => array(
+					'label' => __( 'Get Post Translations', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Return the full translation map for a post: language, post ID, title, permalink, and status for each available translation.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'woocommerce' => array(
+			'section_label'  => __( 'WooCommerce', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Query and manage WooCommerce products, orders, and customers using the native WooCommerce API (HPOS-compatible).', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-cart',
+			'section_badge'  => 'warning',
+			'section_notice' => 'ewpa_section_notice_woocommerce',
+			'abilities'      => array(
+				'ewpa/wc-get-products'        => array(
+					'label' => __( 'Get Products', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List products with price, SKU, stock status, categories, and type. Supports search and category filter.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/wc-get-product'         => array(
+					'label' => __( 'Get Single Product', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Full product detail: price, SKU, stock, description, gallery, attributes, and variations for variable products.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/wc-update-product'      => array(
+					'label' => __( 'Update Product', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Update product price, sale price, stock quantity, status, or description using the WooCommerce API.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/wc-get-orders'          => array(
+					'label' => __( 'Get Orders', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List orders with customer, total, status, and date. HPOS-compatible. Supports filter by status.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/wc-get-order'           => array(
+					'label' => __( 'Get Single Order', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Full order detail: line items, customer billing/shipping, totals, status history, and notes.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/wc-update-order-status' => array(
+					'label' => __( 'Update Order Status', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Change the status of an order (e.g., pending → processing → completed) with an optional note.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/wc-get-customers'       => array(
+					'label' => __( 'Get Customers', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List customers with email, name, total spent, and order count. Supports search by email or name.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'tec'         => array(
+			'section_label'  => __( 'The Events Calendar', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Query and manage events from The Events Calendar plugin, including dates, venues, and organizers.', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-calendar-alt',
+			'section_notice' => 'ewpa_section_notice_tec',
+			'abilities'      => array(
+				'ewpa/tec-get-events'   => array(
+					'label' => __( 'Get Events', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List events with start/end date, venue, and organizer. Supports upcoming/past filter and date range.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/tec-get-event'    => array(
+					'label' => __( 'Get Single Event', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Full event detail with resolved venue address and organizer contact info in a single call.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/tec-create-event' => array(
+					'label' => __( 'Create Event', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Create a new event with title, description, start/end dates, timezone, and venue (by ID or name).', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/tec-update-event' => array(
+					'label' => __( 'Update Event', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Update an existing event: title, description, start/end dates, timezone, or venue.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'cpt'         => array(
+			'section_label'  => __( 'Custom Post Types', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Discover and manage Custom Post Types registered by plugins or themes. Excludes posts, pages, and attachments which have dedicated abilities.', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-archive',
+			'section_badge'  => 'warning',
+			'section_notice' => 'ewpa_section_notice_cpt',
+			'abilities'      => array(
+				'ewpa/list-post-types'    => array(
+					'label' => __( 'List Post Types', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List all public Custom Post Types with their labels, taxonomies, supported features, and capabilities.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-cpt-items'      => array(
+					'label' => __( 'Get CPT Items', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List items from any CPT with filters by status, count, order, and search.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-cpt-item'       => array(
+					'label' => __( 'Get Single CPT Item', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Get full detail of a CPT item by ID, including content, meta data, taxonomies, and featured image.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/create-cpt-item'    => array(
+					'label' => __( 'Create CPT Item', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Create a new item in any CPT with title, content, status, taxonomies, and featured image.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-cpt-item'    => array(
+					'label' => __( 'Update CPT Item', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Update an existing CPT item. Only modifies the fields provided.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/delete-cpt-item'    => array(
+					'label' => __( 'Delete CPT Item', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Send a CPT item to trash or permanently delete it.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-cpt-taxonomies' => array(
+					'label' => __( 'Get CPT Taxonomies', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'List taxonomies and their terms for a given CPT.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/assign-cpt-terms'   => array(
+					'label' => __( 'Assign Terms to CPT Item', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Assign taxonomy terms to a CPT item. Can add to or replace existing terms.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/get-term-meta'      => array(
+					'label' => __( 'Get Term Meta', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Read any single term meta field by exact key, or all meta for a term. Requires edit_term capability.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-term-meta'   => array(
+					'label' => __( 'Update Term Meta', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Write any term meta field by exact key. Requires edit_term capability.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-term'        => array(
+					'label' => __( 'Update Term', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Update a taxonomy term\'s core fields: name, slug, description, or parent. Requires edit_term capability.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'jetengine-options-pages' => array(
+			'section_label'  => __( 'JetEngine — Options Pages', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Read and write JetEngine Options Pages fields. Requires JetEngine with the Options Pages module enabled.', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-admin-settings',
+			'section_badge'  => 'danger',
+			'section_notice' => 'ewpa_section_notice_jetengine_options_pages',
+			'abilities'      => array(
+				'ewpa/je-list-options-pages'        => array(
+					'label'   => __( 'List Options Pages', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'List all registered JetEngine Options Pages with their field schema (no values).', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/je-get-options-page'          => array(
+					'label'   => __( 'Get Options Page', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Return all fields with their current stored values for a given Options Page slug.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/je-update-options-page-field' => array(
+					'label'   => __( 'Update Options Page Field', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Write a new value to a single field of a JetEngine Options Page. Destructive — opt-in required.', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+			),
+		),
+		'jetengine-query-builder' => array(
+			'section_label'  => __( 'JetEngine Query Builder', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'List, read, and update JetEngine Query Builder queries. Complements JetEngine\'s own native "Add Query" MCP tool, which has no edit/get/list equivalent. Requires JetEngine with the Query Builder module.', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-database',
+			'section_badge'  => 'danger',
+			'section_notice' => 'ewpa_section_notice_je_query_builder',
+			'abilities'      => array(
+				'ewpa/je-list-queries' => array(
+					'label'   => __( 'List Queries', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'List all Query Builder queries with id, name, and query type.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/je-get-query'    => array(
+					'label'   => __( 'Get Query', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Get the full settings of one query by id.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/je-update-query' => array(
+					'label'   => __( 'Update Query', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Update an existing query\'s name, type, or arguments. Destructive — opt-in required.', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+			),
+		),
+		'elementor'               => array(
+			'section_label' => __( 'Elementor', 'enable-abilities-for-mcp' ),
+			'section_desc'  => __( 'Read and edit Elementor page/template data. Requires Elementor (Pro for post title, JetEngine for meta fields).', 'enable-abilities-for-mcp' ),
+			'section_icon'  => 'dashicons-layout',
+			'section_badge' => 'danger',
+			'abilities'     => array(
+				'ewpa/elementor-bind-dynamic-field' => array(
+					'label'   => __( 'Bind Dynamic Field', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Bind an Elementor widget setting to a dynamic tag (post title or a JetEngine/meta field). Edits _elementor_data server-side. Destructive — opt-in required.', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+				'ewpa/elementor-get-structure'      => array(
+					'label'   => __( 'Get Structure', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Read-only compact tree of an Elementor page (element ids, types, text preview).', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+				'ewpa/elementor-update-element'     => array(
+					'label'   => __( 'Update Element', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Edit the settings of an Elementor element by id (static content/styles). Destructive.', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+			),
+		),
+		'learndash'               => array(
+			'section_label'  => __( 'LearnDash', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Query and manage LearnDash courses, user progress, quiz results, and enrollments. Requires LearnDash (SFWD_LMS class).', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-welcome-learn-more',
+			'section_badge'  => 'warning',
+			'section_notice' => 'ewpa_section_notice_learndash',
+			'abilities'      => array(
+				'ewpa/ld-get-courses'       => array(
+					'label'   => __( 'Get Courses', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'List published LearnDash courses with title, slug, permalink, and enrolled user count. Supports pagination and title search.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/ld-get-course'        => array(
+					'label'   => __( 'Get Single Course', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Full course detail: title, description, permalink, ordered lessons with topics, and course-level quizzes.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/ld-get-user-progress' => array(
+					'label'   => __( 'Get User Progress', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'User progress in a specific course: enrollment status, steps completed/total, percentage, and completion flag.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/ld-get-quiz-results'  => array(
+					'label'   => __( 'Get Quiz Results', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Quiz attempt history for a user (optionally filtered by quiz ID): score, total, pass/fail, and timestamp. Sorted newest first.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/ld-enroll-user'       => array(
+					'label'   => __( 'Enroll User', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Enroll a user in a LearnDash course. Requires manage_options. Opt-in required — disabled by default.', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+				'ewpa/ld-unenroll-user'     => array(
+					'label'   => __( 'Unenroll User', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Remove a user\'s access to a LearnDash course. Requires manage_options. Destructive — opt-in required.', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+			),
+		),
+		'tutor'                   => array(
+			'section_label'  => __( 'Tutor LMS', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Query and manage Tutor LMS courses, lesson videos, user progress, quiz results, and enrollments. Requires Tutor LMS (tutor_utils()).', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-book',
+			'section_badge'  => 'warning',
+			'section_notice' => 'ewpa_section_notice_tutor',
+			'abilities'      => array(
+				'ewpa/tutor-get-lesson-video'    => array(
+					'label'   => __( 'Get Lesson Video', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Reads a Tutor LMS lesson\'s video source configuration (source type, value, and runtime).', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/tutor-update-lesson-video' => array(
+					'label'   => __( 'Update Lesson Video', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Sets a Tutor LMS lesson\'s video source using Tutor\'s own storage function, avoiding the string-only limitation of the generic Update Post Meta ability.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/tutor-get-courses'         => array(
+					'label'   => __( 'List Courses', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'List published Tutor LMS courses with title, slug, permalink, and enrolled user count. Supports pagination and title search.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/tutor-get-course'          => array(
+					'label'   => __( 'Get Single Course', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Full course detail: title, description, permalink, and topics with ordered lessons, quizzes, and assignments.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/tutor-get-user-progress'   => array(
+					'label'   => __( 'Get User Progress', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'User progress in a specific course: enrollment status/date, steps completed/total, and completion percentage.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/tutor-get-quiz-results'    => array(
+					'label'   => __( 'Get Quiz Results', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Quiz attempt history for a user (optionally filtered by quiz ID): score, total, pass/fail, and timestamps. Sorted newest first.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/tutor-enroll-user'         => array(
+					'label'   => __( 'Enroll User', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Enroll a user in a Tutor LMS course. Requires manage_options. Opt-in required — disabled by default.', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+				'ewpa/tutor-unenroll-user'       => array(
+					'label'   => __( 'Unenroll User', 'enable-abilities-for-mcp' ),
+					'desc'    => __( "Cancel a user's enrollment in a Tutor LMS course. Requires manage_options. Destructive — opt-in required.", 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+			),
+		),
+		'agent-readiness'         => array(
+			'section_label' => __( 'AI — Agent Readiness (llms.txt)', 'enable-abilities-for-mcp' ),
+			'section_desc'  => __( 'Read, validate, and manage the site llms.txt file — the AI-crawler guidance file audited by Lighthouse "Agentic Browsing". Integrates with SEOPress Pro when active; otherwise serves a virtual /llms.txt directly.', 'enable-abilities-for-mcp' ),
+			'section_icon'  => 'dashicons-superhero-alt',
+			'abilities'     => array(
+				'ewpa/get-llms-txt'    => array(
+					'label' => __( 'Get llms.txt', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Fetch the site llms.txt, detect which component serves it, and validate it against the llmstxt.org spec with actionable issues.', 'enable-abilities-for-mcp' ),
+				),
+				'ewpa/update-llms-txt' => array(
+					'label'   => __( 'Update llms.txt', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Write the llms.txt content (SEOPress Pro option when active, or a virtual file served by this plugin). Requires manage_options. Opt-in.', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+			),
+		),
+		'accessibility' => array(
+			'section_label' => __( 'Accessibility (WCAG)', 'enable-abilities-for-mcp' ),
+			'section_desc'  => __( 'Detect accessibility issues WordPress can diagnose server-side. Does not replace a browser-based audit (e.g. Lighthouse) for color contrast, ARIA, or keyboard navigation.', 'enable-abilities-for-mcp' ),
+			'section_icon'  => 'dashicons-universal-access-alt',
+			'abilities'     => array(
+				'ewpa/get-accessibility-snapshot' => array(
+					'label' => __( 'Get Accessibility Snapshot', 'enable-abilities-for-mcp' ),
+					'desc'  => __( 'Scan the media library for images missing alt text (WCAG 1.1.1), paginated.', 'enable-abilities-for-mcp' ),
+				),
+			),
+		),
+		'fse-templates' => array(
+			'section_label'  => __( 'FSE Block Templates', 'enable-abilities-for-mcp' ),
+			'section_desc'   => __( 'Inspect and edit Full Site Editing (FSE/Gutenberg) block templates and template parts. Only available when the active theme supports block templates.', 'enable-abilities-for-mcp' ),
+			'section_icon'   => 'dashicons-layout',
+			'section_badge'  => 'danger',
+			'section_notice' => 'ewpa_section_notice_fse',
+			'abilities'      => array(
+				'ewpa/fse-list-templates'  => array(
+					'label'   => __( 'List Templates', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'List all wp_template and wp_template_part entries for the active theme, with slug, title, area, and whether each is a theme default or a user-edited override.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/fse-get-template'    => array(
+					'label'   => __( 'Get Template', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Get the full block markup for one template or template part by slug.', 'enable-abilities-for-mcp' ),
+					'default' => true,
+				),
+				'ewpa/fse-update-template' => array(
+					'label'   => __( 'Update Template', 'enable-abilities-for-mcp' ),
+					'desc'    => __( 'Write new block markup to a template or template part. Requires edit_theme_options. A header/footer edit affects every page that uses it — opt-in required, disabled by default.', 'enable-abilities-for-mcp' ),
+					'default' => false,
+				),
+			),
+		),
+	);
+}
+
+/**
+ * Returns a flat array of all ability keys.
+ *
+ * @return array
+ */
+function ewpa_get_all_ability_keys() {
+	$keys = array();
+	foreach ( ewpa_get_abilities_registry() as $section ) {
+		$keys = array_merge( $keys, array_keys( $section['abilities'] ) );
+	}
+	return $keys;
+}
+
+/**
+ * Checks if a specific ability is enabled.
+ *
+ * @param string $ability_key The ability key to check.
+ * @return bool
+ */
+function ewpa_is_ability_enabled( $ability_key ) {
+	$enabled = get_option( EWPA_OPTION_KEY, null );
+
+	// First install: all enabled by default.
+	if ( null === $enabled ) {
+		return true;
+	}
+
+	return in_array( $ability_key, (array) $enabled, true );
+}
+
+
+/*
+ * ==========================================================================
+ * SEO PLUGIN DETECTION
+ * ==========================================================================
+ */
+
+/**
+ * Returns the post meta keys for SEO title and description based on the active SEO plugin.
+ *
+ * Detects Rank Math, Yoast SEO, The SEO Framework, SEOPress, and AIOSEO.
+ * Apply the `ewpa_seo_meta_keys` filter to override for any other plugin.
+ *
+ * @return array { 'title' => string, 'description' => string }
+ */
+function ewpa_get_seo_meta_keys() {
+	if ( class_exists( 'RankMath' ) ) {
+		$keys = array(
+			'title'       => 'rank_math_title',
+			'description' => 'rank_math_description',
+		);
+	} elseif ( defined( 'WPSEO_VERSION' ) ) {
+		$keys = array(
+			'title'       => '_yoast_wpseo_title',
+			'description' => '_yoast_wpseo_metadesc',
+		);
+	} elseif ( class_exists( 'The_SEO_Framework\Load' ) ) {
+		$keys = array(
+			'title'       => '_genesis_title',
+			'description' => '_genesis_description',
+		);
+	} elseif ( defined( 'SEOPRESS_VERSION' ) ) {
+		$keys = array(
+			'title'       => '_seopress_titles_title',
+			'description' => '_seopress_titles_desc',
+		);
+	} elseif ( class_exists( 'AIOSEO\Plugin\AIOSEO' ) ) {
+		$keys = array(
+			'title'       => '_aioseo_title',
+			'description' => '_aioseo_description',
+		);
+	} else {
+		$keys = array(
+			'title'       => '_yoast_wpseo_title',
+			'description' => '_yoast_wpseo_metadesc',
+		);
+	}
+
+	return apply_filters( 'ewpa_seo_meta_keys', $keys );
+}
+
+/**
+ * Detects which multilanguage plugin is active.
+ *
+ * @return string 'polylang' | 'wpml' | '' (empty string = none detected)
+ */
+function ewpa_get_translation_plugin(): string {
+	if ( function_exists( 'pll_set_post_language' ) ) {
+		return 'polylang';
+	}
+	if ( defined( 'ICL_SITEPRESS_VERSION' ) ) {
+		return 'wpml';
+	}
+	return '';
+}
+
+
+/*
+ * ==========================================================================
+ * SECTION NOTICE CALLBACKS
+ * ==========================================================================
+ */
+
+/**
+ * Section notice for CPT: shows info when no CPTs are detected.
+ *
+ * @return string
+ */
+function ewpa_section_notice_cpt() {
+	$cpt_types = get_post_types(
+		array(
+			'public'   => true,
+			'_builtin' => false,
+		),
+		'names'
+	);
+
+	// Also check show_in_rest CPTs.
+	$rest_types = get_post_types(
+		array(
+			'show_in_rest' => true,
+			'_builtin'     => false,
+		),
+		'names'
+	);
+
+	$all_cpts = array_unique( array_merge( $cpt_types, $rest_types ) );
+
+	// Remove WordPress internal non-content types.
+	$internal = array( 'wp_block', 'wp_template', 'wp_template_part', 'wp_global_styles', 'wp_navigation', 'wp_font_family', 'wp_font_face' );
+	$all_cpts = array_diff( $all_cpts, $internal );
+
+	if ( ! empty( $all_cpts ) ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'No Custom Post Types detected on this site. These abilities will become available when a plugin or theme registers custom post types (e.g., WooCommerce, ACF, JetEngine).', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
+
+/**
+ * Section notice for SEO: shows info when Rank Math is not active.
+ *
+ * @return string
+ */
+function ewpa_section_notice_rankmath() {
+	if ( ! function_exists( 'is_plugin_active' ) ) {
+		include_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+
+	if ( is_plugin_active( 'seo-by-rank-math/rank-math.php' ) ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'Rank Math SEO plugin is not active. These abilities require Rank Math to function.', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
+
+/**
+ * Section notice for SEOPress: shows info when SEOPress is not active.
+ *
+ * @return string
+ */
+function ewpa_section_notice_seopress() {
+	if ( defined( 'SEOPRESS_VERSION' ) ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'SEOPress plugin is not active. These abilities require SEOPress to function.', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
+
+/**
+ * Section notice for Yoast SEO: shows info when Yoast SEO is not active.
+ *
+ * @return string
+ */
+function ewpa_section_notice_yoast() {
+	if ( defined( 'WPSEO_VERSION' ) ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'Yoast SEO plugin is not active. These abilities require Yoast SEO to function.', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
+
+/**
+ * Section notice for WooCommerce: shows info when WooCommerce is not active.
+ *
+ * @return string
+ */
+function ewpa_section_notice_woocommerce() {
+	if ( class_exists( 'WooCommerce' ) ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'WooCommerce is not active. These abilities require WooCommerce to function.', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
+
+/**
+ * Section notice for The Events Calendar: shows info when the plugin is not active.
+ *
+ * @return string
+ */
+function ewpa_section_notice_tec() {
+	if ( class_exists( 'Tribe__Events__Main' ) ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'The Events Calendar plugin is not active. These abilities require The Events Calendar to function.', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
+
+/**
+ * Section notice for Multilanguage: shows info when neither Polylang nor WPML is active.
+ *
+ * @return string
+ */
+/**
+ * Section notice for Code Snippets: warns when plugin is inactive, always shows security notice.
+ *
+ * @return string
+ */
+function ewpa_section_notice_code_snippets() {
+	$plugin_active = function_exists( 'save_snippet' )
+		|| class_exists( '\Code_Snippets\Snippet' )
+		|| class_exists( 'Snippet' );
+
+	$out = '';
+
+	if ( ! $plugin_active ) {
+		$out .= '<div class="ewpa-section-notice ewpa-section-notice-info">'
+			. '<span class="dashicons dashicons-info"></span> '
+			. esc_html__( 'Code Snippets plugin is not active. This ability requires Code Snippets 2.x or 3.x to function.', 'enable-abilities-for-mcp' )
+			. '</div>';
+	}
+
+	$out .= '<div class="ewpa-section-notice ewpa-section-notice-warning">'
+		. '<span class="dashicons dashicons-warning"></span> '
+		. esc_html__( 'Security: snippets are always saved as inactive and must be activated manually from wp-admin › Snippets. Enable only in trusted environments. Requires manage_options.', 'enable-abilities-for-mcp' )
+		. '</div>';
+
+	return $out;
+}
+
+function ewpa_section_notice_multilanguage() {
+	if ( ewpa_get_translation_plugin() ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'No multilanguage plugin detected. These abilities require Polylang or WPML to function.', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
+
+/**
+ * Section notice for JetEngine Options Pages: shows info when JetEngine or its Options Pages module is inactive.
+ *
+ * @return string
+ */
+function ewpa_section_notice_jetengine_options_pages(): string {
+	if ( function_exists( 'jet_engine' ) && isset( jet_engine()->options_pages ) ) {
+		return '';
+	}
+
+	$msg = function_exists( 'jet_engine' )
+		? __( 'JetEngine is active but the Options Pages module is not enabled. Enable it under JetEngine › Settings › Modules.', 'enable-abilities-for-mcp' )
+		: __( 'JetEngine plugin is not active. These abilities require JetEngine with the Options Pages module enabled.', 'enable-abilities-for-mcp' );
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html( $msg )
+		. '</div>';
+}
+
+/**
+ * Section notice for LearnDash: shows info when LearnDash is not active.
+ *
+ * @return string
+ */
+function ewpa_section_notice_learndash(): string {
+	if ( class_exists( 'SFWD_LMS' ) ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'LearnDash is not active. These abilities require LearnDash (SFWD_LMS) to function.', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
+
+/**
+ * Dashboard notice shown for the Tutor LMS section when the plugin is inactive.
+ *
+ * @return string
+ */
+function ewpa_section_notice_tutor(): string {
+	if ( function_exists( 'tutor_utils' ) ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'Tutor LMS is not active. These abilities require Tutor LMS to function.', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
+
+/**
+ * Dashboard notice shown for the JetEngine Query Builder section when the
+ * Query Builder module is not available.
+ *
+ * @return string
+ */
+function ewpa_section_notice_je_query_builder(): string {
+	if ( function_exists( 'jet_engine' ) && class_exists( '\Jet_Engine\Query_Builder\Manager' ) ) {
+		return '';
+	}
+
+	$msg = function_exists( 'jet_engine' )
+		? __( 'JetEngine is active but the Query Builder module is not enabled. Enable it under JetEngine › Settings › Modules.', 'enable-abilities-for-mcp' )
+		: __( 'JetEngine plugin is not active. These abilities require JetEngine with the Query Builder module enabled.', 'enable-abilities-for-mcp' );
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html( $msg )
+		. '</div>';
+}
+
+/**
+ * Dashboard notice shown for the FSE Block Templates section when the active
+ * theme does not support block templates.
+ *
+ * @return string
+ */
+function ewpa_section_notice_fse(): string {
+	if ( current_theme_supports( 'block-templates' ) ) {
+		return '';
+	}
+
+	return '<div class="ewpa-section-notice ewpa-section-notice-info">'
+		. '<span class="dashicons dashicons-info"></span> '
+		. esc_html__( 'The active theme does not support block templates (Full Site Editing). These abilities require a block-based theme.', 'enable-abilities-for-mcp' )
+		. '</div>';
+}
