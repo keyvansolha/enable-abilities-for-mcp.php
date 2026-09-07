@@ -642,30 +642,57 @@ function ewpa_render_settings_page(): void {
 								<?php esc_html_e( 'Create a Client ID and Secret by hand', 'enable-abilities-for-mcp' ); ?>
 							</summary>
 							<div style="margin-top: 10px;">
-								<p class="description" style="margin: 0 0 8px;">
-									<?php esc_html_e( 'Only needed when a connector asks you to paste a Client ID (and optionally a Secret) instead of registering itself. The callback URLs you enter here must already be in the allowed list above. The secret is shown once and only its hash is stored.', 'enable-abilities-for-mcp' ); ?>
+								<p class="description" style="margin: 0 0 12px;">
+									<?php esc_html_e( 'Use this when a connector asks you to paste credentials instead of registering itself. The endpoint URLs below are fixed and always valid; the Client ID and Secret appear once you create a client. The callback URLs you enter must already be in the allowed list above, and the secret is shown only once — only its hash is stored.', 'enable-abilities-for-mcp' ); ?>
 								</p>
+
+								<?php /* Endpoint URLs are static, so show them before anything is created. */ ?>
+								<table class="widefat striped" style="margin-bottom: 14px;">
+									<tbody>
+										<tr>
+											<td style="width: 190px;"><strong><?php esc_html_e( 'Authorization URL', 'enable-abilities-for-mcp' ); ?></strong></td>
+											<td><code id="ewpa-conn-authz-url" style="word-break: break-all;"><?php echo esc_html( home_url( '/oauth/authorize' ) ); ?></code></td>
+											<td style="width: 70px;"><button type="button" class="button button-small ewpa-copy-btn" data-target="ewpa-conn-authz-url"><?php esc_html_e( 'Copy', 'enable-abilities-for-mcp' ); ?></button></td>
+										</tr>
+										<tr>
+											<td><strong><?php esc_html_e( 'Token URL', 'enable-abilities-for-mcp' ); ?></strong></td>
+											<td><code id="ewpa-conn-token-url" style="word-break: break-all;"><?php echo esc_html( home_url( '/oauth/token' ) ); ?></code></td>
+											<td><button type="button" class="button button-small ewpa-copy-btn" data-target="ewpa-conn-token-url"><?php esc_html_e( 'Copy', 'enable-abilities-for-mcp' ); ?></button></td>
+										</tr>
+										<tr>
+											<td><strong><?php esc_html_e( 'Scope', 'enable-abilities-for-mcp' ); ?></strong></td>
+											<td><code id="ewpa-conn-scope">mcp</code></td>
+											<td><button type="button" class="button button-small ewpa-copy-btn" data-target="ewpa-conn-scope"><?php esc_html_e( 'Copy', 'enable-abilities-for-mcp' ); ?></button></td>
+										</tr>
+										<tr>
+											<td><strong><?php esc_html_e( 'PKCE', 'enable-abilities-for-mcp' ); ?></strong></td>
+											<td colspan="2" class="description"><?php esc_html_e( 'Required — S256. The connector must send code_challenge; a request without it is refused.', 'enable-abilities-for-mcp' ); ?></td>
+										</tr>
+									</tbody>
+								</table>
+
 								<p>
 									<label for="ewpa-conn-name" style="display: block; margin-bottom: 4px;"><?php esc_html_e( 'Name', 'enable-abilities-for-mcp' ); ?></label>
 									<input type="text" id="ewpa-conn-name" class="regular-text" placeholder="<?php esc_attr_e( 'ChatGPT', 'enable-abilities-for-mcp' ); ?>">
 								</p>
 								<p>
 									<label for="ewpa-conn-uris" style="display: block; margin-bottom: 4px;"><?php esc_html_e( 'Callback URLs (one per line)', 'enable-abilities-for-mcp' ); ?></label>
-									<textarea id="ewpa-conn-uris" rows="3" class="large-text code" spellcheck="false" style="font-family: Consolas, Monaco, monospace; font-size: 12px;"></textarea>
+									<textarea id="ewpa-conn-uris" rows="3" class="large-text code" spellcheck="false" style="font-family: Consolas, Monaco, monospace; font-size: 12px;"><?php echo esc_textarea( $ewpa_conn_callbacks ); ?></textarea>
+									<span class="description"><?php esc_html_e( 'Prefilled from the allowed list above. Trim it to the callback your connector actually uses.', 'enable-abilities-for-mcp' ); ?></span>
 								</p>
 								<p>
 									<label>
-										<input type="checkbox" id="ewpa-conn-secret">
-										<?php esc_html_e( 'Also issue a client secret', 'enable-abilities-for-mcp' ); ?>
+										<input type="checkbox" id="ewpa-conn-secret" checked>
+										<?php esc_html_e( 'Also issue a client secret (needed when the connector has a Client Secret field)', 'enable-abilities-for-mcp' ); ?>
 									</label>
 								</p>
 								<p style="display: flex; align-items: center; gap: 10px;">
-									<button type="button" class="button" id="ewpa-conn-create">
+									<button type="button" class="button button-primary" id="ewpa-conn-create">
 										<?php esc_html_e( 'Create client', 'enable-abilities-for-mcp' ); ?>
 									</button>
 									<span class="description" id="ewpa-conn-create-msg" style="font-size: 12px;"></span>
 								</p>
-								<div id="ewpa-conn-created" style="display: none; padding: 10px 12px; background: #f6f7f7; border: 1px solid #dcdcde;"></div>
+								<div id="ewpa-conn-created" style="display: none; padding: 12px 14px; background: #f6f7f7; border: 1px solid #dcdcde;"></div>
 							</div>
 						</details>
 
@@ -769,15 +796,25 @@ function ewpa_render_settings_page(): void {
 										msg.textContent = ( result && result.data && result.data.message ) || '<?php echo esc_js( __( 'Could not create the client.', 'enable-abilities-for-mcp' ) ); ?>';
 										return;
 									}
-									var lines = [ '<?php echo esc_js( __( 'Client ID', 'enable-abilities-for-mcp' ) ); ?>: ' + result.data.client_id ];
+									// Everything the connector form asks for, in one block.
+									var lines = [
+										'<?php echo esc_js( __( 'Authorization URL', 'enable-abilities-for-mcp' ) ); ?>: <?php echo esc_js( home_url( '/oauth/authorize' ) ); ?>',
+										'<?php echo esc_js( __( 'Token URL', 'enable-abilities-for-mcp' ) ); ?>: <?php echo esc_js( home_url( '/oauth/token' ) ); ?>',
+										'<?php echo esc_js( __( 'Scope', 'enable-abilities-for-mcp' ) ); ?>: mcp',
+										'<?php echo esc_js( __( 'Client ID', 'enable-abilities-for-mcp' ) ); ?>: ' + result.data.client_id
+									];
 									if ( result.data.client_secret ) {
 										lines.push( '<?php echo esc_js( __( 'Client Secret', 'enable-abilities-for-mcp' ) ); ?>: ' + result.data.client_secret );
-										lines.push( '<?php echo esc_js( __( 'Copy the secret now — it is not shown again.', 'enable-abilities-for-mcp' ) ); ?>' );
+										lines.push( '' );
+										lines.push( '<?php echo esc_js( __( '⚠ Copy the secret now — it is not shown again.', 'enable-abilities-for-mcp' ) ); ?>' );
 									}
 									out.textContent = lines.join( '\n' );
 									out.style.whiteSpace = 'pre-wrap';
 									out.style.wordBreak = 'break-all';
+									out.style.fontFamily = 'Consolas, Monaco, monospace';
+									out.style.fontSize = '12px';
 									out.style.display = '';
+									msg.textContent = '<?php echo esc_js( __( 'Created. Reload the page to see it in the table.', 'enable-abilities-for-mcp' ) ); ?>';
 								} );
 							} );
 						}
