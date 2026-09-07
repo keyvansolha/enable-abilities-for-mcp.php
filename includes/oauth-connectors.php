@@ -219,6 +219,9 @@ function ewpa_oauth_connectors_enabled(): bool {
  */
 function ewpa_oauth_default_callbacks(): array {
 	return array(
+		// ChatGPT mints a connector id per connector, so the callback is a
+		// wildcard: https://chatgpt.com/connector/oauth/<connector id>
+		'https://chatgpt.com/connector/oauth/*',
 		'https://chatgpt.com/connector_platform_oauth_redirect',
 		'https://chatgpt.com/backend-api/aip/connectors/links/oauth/callback',
 		'https://chat.openai.com/connector_platform_oauth_redirect',
@@ -442,6 +445,202 @@ function ewpa_oauth_redirect_uri_matches( string $provided, array $registered ):
 	}
 
 	return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * CIMD — Client ID Metadata Documents for non-Claude publishers
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Maximum size of a metadata document this site will read.
+ */
+define( 'EWPA_CIMD_MAX_BYTES', 8192 );
+
+/**
+ * Publisher hosts whose metadata documents may be dereferenced.
+ *
+ * Derived from the callback allowlist rather than a second setting: a host the
+ * admin has already trusted to receive authorization codes is, by
+ * construction, safe to fetch a metadata document from — strictly less
+ * dangerous than redirecting a user there with a code. It also means there is
+ * one list to maintain, and no way for the two to drift apart.
+ *
+ * Loopback entries are excluded; a native app on localhost does not publish a
+ * metadata document, and dereferencing 127.0.0.1 server-side is pointless.
+ *
+ * @return string[] Lowercased hostnames.
+ */
+function ewpa_oauth_cimd_hosts(): array {
+	$hosts = array();
+
+	foreach ( ewpa_oauth_get_callback_allowlist() as $pattern ) {
+		$parts = wp_parse_url( $pattern );
+
+		if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
+			continue;
+		}
+
+		if ( 'https' !== strtolower( (string) ( $parts['scheme'] ?? '' ) ) ) {
+			continue;
+		}
+
+		$host = strtolower( (string) $parts['host'] );
+
+		if ( ewpa_oauth_is_loopback_host( $host ) ) {
+			continue;
+		}
+
+		$hosts[ $host ] = true;
+	}
+
+	return array_keys( $hosts );
+}
+
+/**
+ * Resolve a Client ID Metadata Document into a client record.
+ *
+ * The bundled library also implements CIMD, but pins each publisher to an
+ * exact, known client_id URL and refuses any document whose
+ * token_endpoint_auth_method is not "none". Neither holds for ChatGPT: it
+ * mints a fresh client_id URL per connector, and its document declares
+ * private_key_jwt. This resolver takes the publisher host as the trust anchor
+ * instead, and treats the client as public — this server only ever advertises
+ * "none", PKCE binds the authorization code, and no client authentication is
+ * relied upon at the token endpoint.
+ *
+ * @param string $client_id The client_id URL the connector presented.
+ * @return array<string, mixed>|WP_Error|null Client record; WP_Error when the
+ *         document resolves but is unusable; null when the host is not ours to
+ *         resolve, leaving the caller to report a generic failure.
+ */
+function ewpa_oauth_resolve_cimd( string $client_id ) {
+	$parts = wp_parse_url( $client_id );
+
+	if ( ! is_array( $parts ) || 'https' !== strtolower( (string) ( $parts['scheme'] ?? '' ) ) || empty( $parts['host'] ) ) {
+		return null;
+	}
+
+	// A fragment or userinfo component is never legitimate in a client_id.
+	if ( isset( $parts['fragment'] ) || isset( $parts['user'] ) || isset( $parts['pass'] ) ) {
+		return null;
+	}
+
+	$path = (string) ( $parts['path'] ?? '' );
+
+	if ( '' === $path || '/' === $path ) {
+		return null;
+	}
+
+	$host = strtolower( (string) $parts['host'] );
+
+	if ( ! in_array( $host, ewpa_oauth_cimd_hosts(), true ) ) {
+		return null;
+	}
+
+	$cache_key = 'ewpa_cimd_' . md5( $client_id );
+	$cached    = get_transient( $cache_key );
+
+	if ( is_array( $cached ) ) {
+		return $cached;
+	}
+
+	$response = wp_safe_remote_get(
+		$client_id,
+		array(
+			'timeout'             => 5,
+			'redirection'         => 0,
+			'limit_response_size' => EWPA_CIMD_MAX_BYTES,
+			'headers'             => array( 'Accept' => 'application/json' ),
+		)
+	);
+
+	if ( is_wp_error( $response ) ) {
+		ewpa_oauth_log( 'CIMD', 'fetch failed', array( 'client_id' => $client_id, 'error' => $response->get_error_message() ) );
+
+		return new WP_Error(
+			'cimd_fetch_failed',
+			sprintf(
+				/* translators: %s: the metadata URL that could not be fetched */
+				__( 'This site could not fetch the connector\'s metadata document at %s. Check that the site can make outbound HTTPS requests.', 'enable-abilities-for-mcp' ),
+				$client_id
+			)
+		);
+	}
+
+	if ( 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+		return new WP_Error(
+			'cimd_fetch_failed',
+			sprintf(
+				/* translators: 1: metadata URL, 2: HTTP status code */
+				__( 'The connector\'s metadata document at %1$s returned HTTP %2$d.', 'enable-abilities-for-mcp' ),
+				$client_id,
+				(int) wp_remote_retrieve_response_code( $response )
+			)
+		);
+	}
+
+	$doc = json_decode( (string) wp_remote_retrieve_body( $response ), true );
+
+	if ( ! is_array( $doc ) || empty( $doc ) ) {
+		return new WP_Error( 'cimd_invalid', __( 'The connector\'s metadata document is not a JSON object.', 'enable-abilities-for-mcp' ) );
+	}
+
+	// The document must claim the exact URL it was fetched from, so a publisher
+	// cannot host a document that impersonates a different client.
+	if ( $client_id !== ewpa_oauth_str( $doc['client_id'] ?? null ) ) {
+		return new WP_Error( 'cimd_invalid', __( 'The connector\'s metadata document declares a different client_id than the URL it was fetched from.', 'enable-abilities-for-mcp' ) );
+	}
+
+	$redirects = ewpa_oauth_str_list( $doc['redirect_uris'] ?? null );
+
+	if ( empty( $redirects ) ) {
+		return new WP_Error( 'cimd_invalid', __( 'The connector\'s metadata document lists no redirect_uris.', 'enable-abilities-for-mcp' ) );
+	}
+
+	$grants = ewpa_oauth_str_list( $doc['grant_types'] ?? null );
+
+	if ( ! empty( $grants ) && ! in_array( 'authorization_code', $grants, true ) ) {
+		return new WP_Error( 'cimd_invalid', __( 'The connector does not offer the authorization_code grant.', 'enable-abilities-for-mcp' ) );
+	}
+
+	// The callback allowlist still governs, exactly as it does for a client
+	// that registers itself. A publisher does not get to nominate its own
+	// redirect targets just because its host is trusted.
+	$allowed = array_values( array_filter( $redirects, 'ewpa_oauth_callback_is_allowed' ) );
+
+	if ( empty( $allowed ) ) {
+		return new WP_Error(
+			'cimd_redirect_not_allowed',
+			sprintf(
+				/* translators: %s: the callback URL the connector wants to use */
+				__( 'The connector wants to send users back to %s, which is not in this site\'s allowed callback URLs. Add it under Settings › WP Abilities › Connection › Allowed callback URLs, then try again.', 'enable-abilities-for-mcp' ),
+				implode( ', ', $redirects )
+			)
+		);
+	}
+
+	$client_name = sanitize_text_field( ewpa_oauth_str( $doc['client_name'] ?? null ) );
+
+	$record = array(
+		'client_id'                  => $client_id,
+		'client_name'                => '' !== $client_name ? $client_name : $host,
+		'client_uri'                 => esc_url_raw( ewpa_oauth_str( $doc['client_uri'] ?? null ) ),
+		'redirect_uris'              => $allowed,
+		'grant_types'                => array( 'authorization_code', 'refresh_token' ),
+		// Treated as public regardless of what the document asks for: this
+		// server advertises only "none" and never checks client credentials.
+		'token_endpoint_auth_method' => 'none',
+		'client_secret_hash'         => '',
+		'source'                     => 'cimd',
+		'publisher'                  => $host,
+		'created'                    => time(),
+	);
+
+	set_transient( $cache_key, $record, HOUR_IN_SECONDS );
+
+	ewpa_oauth_log( 'CIMD', 'client resolved', array( 'client_id' => $client_id, 'publisher' => $host ) );
+
+	return $record;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -861,37 +1060,57 @@ function ewpa_oauth_maybe_handle_authorize(): void {
 			if ( $verifier->is_trusted_host( $client_id ) ) {
 				return;
 			}
-		} elseif ( 0 === strpos( strtolower( $client_id ), 'https://' ) ) {
-			// Verifier unavailable: fall back to leaving URL-shaped ids alone.
-			return;
 		}
 
-		// Everything else dead-ends in the library with no clue as to why, so
-		// name the id and say which of the two shapes it is.
-		ewpa_oauth_log(
-			'AUTHORIZE',
-			'rejected: client_id is not registered on this site',
-			array( 'client_id' => $client_id )
-		);
+		// A metadata URL on a publisher host the admin already trusts (ChatGPT,
+		// most often) is resolved here, since the library pins each publisher
+		// to an exact client_id URL and ChatGPT mints a fresh one per connector.
+		$resolved = ewpa_oauth_resolve_cimd( $client_id );
 
-		$is_url = 0 === strpos( strtolower( $client_id ), 'https://' );
+		if ( is_wp_error( $resolved ) ) {
+			ewpa_oauth_log(
+				'AUTHORIZE',
+				'rejected: CIMD document unusable',
+				array( 'client_id' => $client_id, 'error' => $resolved->get_error_message() )
+			);
 
-		$detail = $is_url
-			? __( 'That is a metadata URL, so the connector expects this site to trust its publisher. Only claude.ai is trusted by default — send this whole message over and the publisher can be added.', 'enable-abilities-for-mcp' )
-			: __( 'That is an opaque ID, so it should have been issued by this site. Remove and re-add the connector so it registers itself, or create a client under Settings › WP Abilities › Connection and paste that exact Client ID.', 'enable-abilities-for-mcp' );
+			wp_die(
+				esc_html( $resolved->get_error_message() ),
+				esc_html__( 'OAuth Error', 'enable-abilities-for-mcp' ),
+				array( 'response' => 400 )
+			);
+		}
 
-		wp_die(
-			esc_html(
-				sprintf(
-					/* translators: 1: the client ID the connector presented, 2: what to do about it */
-					__( 'This connector is not registered on this site. It presented the client ID: %1$s — %2$s', 'enable-abilities-for-mcp' ),
-					$client_id,
-					$detail
-				)
-			),
-			esc_html__( 'Unknown OAuth client', 'enable-abilities-for-mcp' ),
-			array( 'response' => 400 )
-		);
+		if ( is_array( $resolved ) ) {
+			$client = $resolved;
+		} else {
+			// Neither registered here nor resolvable — name the id, since the
+			// library's bare "Unknown OAuth client." says nothing useful.
+			ewpa_oauth_log(
+				'AUTHORIZE',
+				'rejected: client_id is not registered on this site',
+				array( 'client_id' => $client_id )
+			);
+
+			$is_url = 0 === strpos( strtolower( $client_id ), 'https://' );
+
+			$detail = $is_url
+				? __( 'That is a metadata URL, but its host is not among this site\'s allowed callback URLs, so the document is never fetched. Add a callback URL on that host under Settings › WP Abilities › Connection.', 'enable-abilities-for-mcp' )
+				: __( 'That is an opaque ID, so it should have been issued by this site. Remove and re-add the connector so it registers itself, or create a client under Settings › WP Abilities › Connection and paste that exact Client ID.', 'enable-abilities-for-mcp' );
+
+			wp_die(
+				esc_html(
+					sprintf(
+						/* translators: 1: the client ID the connector presented, 2: what to do about it */
+						__( 'This connector is not registered on this site. It presented the client ID: %1$s — %2$s', 'enable-abilities-for-mcp' ),
+						$client_id,
+						$detail
+					)
+				),
+				esc_html__( 'Unknown OAuth client', 'enable-abilities-for-mcp' ),
+				array( 'response' => 400 )
+			);
+		}
 	}
 
 	$redirect_uri          = esc_url_raw( wp_unslash( $_GET['redirect_uri'] ?? '' ) );
@@ -959,7 +1178,7 @@ function ewpa_oauth_maybe_handle_authorize(): void {
 			'client_name'           => (string) ( $client['client_name'] ?? '' ),
 			'client_uri'            => (string) ( $client['client_uri'] ?? '' ),
 			'verified'              => true,
-			'publisher'             => '',
+			'publisher'             => (string) ( $client['publisher'] ?? '' ),
 			'redirect_uri'          => $redirect_uri,
 			'code_challenge'        => $code_challenge,
 			'code_challenge_method' => $code_challenge_method,

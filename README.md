@@ -148,18 +148,35 @@ The bundled OAuth library ([`wp-media/mcp-oauth`](https://github.com/wp-media/mc
 specification. A client presents an HTTPS URL as its `client_id`; the server fetches that URL and
 validates the metadata document it finds there.
 
-That works beautifully for Claude and not at all for ChatGPT:
+ChatGPT *also* uses CIMD — but the library's implementation rejects it on three separate counts.
+Here is a real ChatGPT connector document:
 
-- The trusted-publisher allowlist is hardcoded to `claude.ai`
-  ([`ClaudeClientVerifier.php`](vendor/wp-media/mcp-oauth/inc/Auth/ClaudeClientVerifier.php)),
-  and that host gate also decides which URLs are ever fetched at all.
-- `AuthorizeEndpoint` hard-rejects any client whose document does not verify.
-- ChatGPT publishes no such document. It expects **RFC 7591 Dynamic Client Registration** — a
-  `POST` to a `registration_endpoint` that hands back a `client_id`.
-- The library exposes no registration endpoint and does not advertise one.
+```json
+{
+  "client_id": "https://chatgpt.com/oauth/j0wKlDBsmsUM/client.json",
+  "redirect_uris": ["https://chatgpt.com/connector/oauth/j0wKlDBsmsUM"],
+  "token_endpoint_auth_method": "private_key_jwt",
+  "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+  "client_name": "ChatGPT",
+  "jwks_uri": "https://chatgpt.com/oauth/jwks.json"
+}
+```
 
-The library's `wpmedia_mcp_oauth_trusted_publishers` filter cannot bridge this: it only adds more
-*CIMD* publishers, and ChatGPT has no CIMD document to add.
+1. **`token_endpoint_auth_method` is `private_key_jwt`.** `CimdResolver::validate_document()`
+   refuses any document whose method is not `none`, so `resolve()` returns null and
+   `AuthorizeEndpoint` dies with a bare `Unknown OAuth client.`
+2. **`chatgpt.com` is not a trusted host.** The allowlist is hardcoded to `claude.ai`
+   ([`ClaudeClientVerifier.php`](vendor/wp-media/mcp-oauth/inc/Auth/ClaudeClientVerifier.php)),
+   and that gate also decides which URLs are fetched at all.
+3. **The client ID is unique per connector.** `j0wKlDBsmsUM` is minted fresh for each connector
+   you create, and `matches_publisher()` pins each publisher to an *exact* client_id URL — so no
+   static list can ever match.
+
+Point 3 is why the library's `wpmedia_mcp_oauth_trusted_publishers` filter cannot bridge the gap:
+it can add a host, but the exact-URL pin behind it still fails.
+
+Dynamic Client Registration is supported here too (`/oauth/register`), since other MCP clients use
+it — but ChatGPT itself never calls it.
 
 ### Design: no vendor patching
 
@@ -184,7 +201,7 @@ Only four handlers were needed:
 | Handler | What it does |
 |---|---|
 | `/oauth/register` | New endpoint. RFC 7591 dynamic client registration. |
-| `/oauth/authorize` | Validates and admits locally-registered clients; writes the library's state transient. |
+| `/oauth/authorize` | Admits locally-registered clients **and resolves CIMD documents for allowlisted publisher hosts**; writes the library's state transient. |
 | `/oauth/authorize-callback` | Renders the consent screen with the opaque `client_id` suppressed. |
 | `/oauth/token` | Verifies a client secret when the client has one, then hands off. |
 | `.well-known/oauth-authorization-server` | Republished with `registration_endpoint` added. |
@@ -262,6 +279,13 @@ What these reject, and why it matters:
 **The list is enforced twice** — when a client registers, *and again on every single authorization
 request*. Removing a URL immediately blocks clients that registered while it was still allowed;
 you do not have to hunt down and revoke them.
+
+It does double duty as the **CIMD publisher allowlist**. A metadata document is only ever fetched
+from a host that already appears here, which is deliberate: a host you have trusted to receive
+authorization codes is, by construction, safe to fetch a document from — strictly less dangerous
+than redirecting a user there with a code in hand. One list, no drift between two settings. And a
+publisher does not get to nominate its own redirect targets just because its host is trusted: every
+`redirect_uri` in a fetched document is still checked against the list.
 
 ### Full authorization flow
 
